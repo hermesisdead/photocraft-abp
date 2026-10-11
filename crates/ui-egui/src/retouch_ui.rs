@@ -327,7 +327,7 @@ fn pct(ui: &mut egui::Ui, label: &str, v: &mut f32) {
 
 /// Options bar for the retouching and smart-selection tools. Returns false for other tools.
 pub fn options_bar(app: &mut PhotocraftApp, ui: &mut egui::Ui, tool: Tool) -> bool {
-    if !tool.is_brushlike() && !matches!(tool, Tool::QuickSelection | Tool::ObjectSelection | Tool::Patch | Tool::ContentAwareMove | Tool::RedEye)
+    if !tool.is_brushlike() && !matches!(tool, Tool::QuickSelection | Tool::ObjectSelection | Tool::Patch | Tool::ContentAwareMove | Tool::GenerativeFill | Tool::RedEye)
         || matches!(tool, Tool::Brush | Tool::Pencil | Tool::MixerBrush | Tool::Eraser)
     {
         return false;
@@ -384,6 +384,10 @@ pub fn options_bar(app: &mut PhotocraftApp, ui: &mut egui::Ui, tool: Tool) -> bo
             crate::widgets::checkbox(ui, &mut o.sample_all_layers, tl!("Sample All Layers"));
             crate::widgets::vline(ui, 22.0);
             opt(ui, tl!("Lasso around an area, then drag the selection"));
+        }
+        Tool::GenerativeFill => {
+            opt(ui, tl!("Lasso around an area, then Generate…"));
+            crate::generative_fill_ui::tool_options(app, ui);
         }
         Tool::PatternStamp => {
             pattern_stamp_options(app, ui);

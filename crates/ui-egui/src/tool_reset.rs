@@ -153,6 +153,7 @@ pub fn reset_options(o: &mut ToolOptions, tool: Tool) {
         Tool::Healing => reset!(clone_aligned, clone_sample),
         Tool::Patch => reset!(patch_mode, patch_content_aware, patch_structure, patch_color, sample_all_layers),
         Tool::ContentAwareMove => reset!(cam_mode, cam_structure, cam_color, sample_all_layers),
+        Tool::GenerativeFill => {}
         Tool::RedEye => reset!(red_eye_pupil_size, red_eye_darken),
         Tool::CloneStamp => reset!(clone_aligned, clone_sample),
         Tool::PatternStamp => reset!(pattern_stamp_aligned, pattern_stamp_impressionist, pattern_stamp_scale, pattern_stamp_angle),

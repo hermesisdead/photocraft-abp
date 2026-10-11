@@ -834,6 +834,14 @@ pub fn invoke(app: &mut PhotocraftApp, _ctx: &egui::Context, id: &str, params: &
             }
             dialog(d)
         }
+        "ai.generativeFill" => {
+            // The pop-up is generated from the command's parameters; the engine checks the model
+            // and the selection when it runs (`generative_fill_cmds`).
+            if !app.session.is_enabled(id) {
+                return Some(Err("Generative Fill needs a selection on a pixel layer".into()));
+            }
+            dialog(crate::filter_dialog::open(app, id))
+        }
         "edit.contentAwareScale" => {
             let st = app.session.active()?;
             let b = match &st.doc.selection {
@@ -3074,6 +3082,23 @@ mod tests {
         autosave_now(&mut app);
         tick(&mut app, &ctx);
         assert_eq!(take(), [format!("discard {}", ids[0]), format!("save {}", ids[1])]);
+    }
+
+    #[test]
+    fn generative_fill_pop_up_needs_a_selection_then_opens_with_its_defaults() {
+        let (mut app, _) = app_with_store();
+        let ctx = egui::Context::default();
+        app.run("file.new", json!({"width": 32, "height": 32})).unwrap();
+        app.sync_views();
+        assert!(crate::menus::invoke(&mut app, &ctx, "ai.generativeFill", json!({})).is_err(), "no selection, no pop-up");
+        app.run("select.rect", json!({"x": 4, "y": 4, "width": 8, "height": 8})).unwrap();
+        let d = crate::menus::invoke(&mut app, &ctx, "ai.generativeFill", json!({})).unwrap()["dialog"].as_u64().unwrap();
+        let fields = &app.ui.dialogs.iter().find(|x| x.id == d).unwrap().fields;
+        assert_eq!(fields["__command"], "ai.generativeFill");
+        assert_eq!(fields["prompt"], "");
+        assert_eq!(fields["steps"].as_f64(), Some(20.0));
+        assert_eq!(fields["guidance"].as_f64(), Some(7.5));
+        assert!(!fields.contains_key("__preview"), "the fill has no live preview yet");
     }
 
     #[test]

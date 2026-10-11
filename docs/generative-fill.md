@@ -4,7 +4,10 @@ The Generative Fill tool sits in the retouching group of the toolbar, next to Co
 Draw a selection with it, then use its options bar:
 
 - **Generate…** opens the Generative Fill pop-up (prompt, negative prompt, steps, guidance, model).
-- **Models…** opens the model browser: search Hugging Face, download a model, remove one.
+- **Models…** opens the model window: a dropdown of every `.onnx` file in the models folder,
+  a one-click **Download default model** button (LaMa, about 208 MB) with a progress bar, Cancel,
+  and a red error message with **Try again** if a download fails, an **Open models folder** button
+  (drop your own `.onnx` files in and press Refresh), and a Hugging Face search for more models.
 
 ## What works
 

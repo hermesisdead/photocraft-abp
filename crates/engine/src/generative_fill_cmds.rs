@@ -15,6 +15,7 @@
 //! value is an error, never a panic.
 
 use std::path::{Component, Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -33,6 +34,17 @@ pub const MAX_MODEL_BYTES: u64 = 4 << 30;
 const MAX_PROMPT_CHARS: usize = 1000;
 const HUB: &str = "https://huggingface.co";
 const MANIFEST: &str = "manifest.json";
+const SELECTED: &str = "selected.txt";
+const SELECT: &str = "ai.generativeFill.select";
+const LOCAL: &str = "ai.generativeFill.localModels";
+/// How deep under the models folder `.onnx` files are looked for, and how many are listed.
+const SCAN_DEPTH: usize = 3;
+const SCAN_LIMIT: usize = 500;
+
+/// The model offered as the one-click default: LaMa, a small (about 208 MB) Apache-2.0 inpainting
+/// network. Its size and SHA-256 come from the hub's own file listing when it is downloaded.
+pub const DEFAULT_MODEL_REPO: &str = "Carve/LaMa-ONNX";
+pub const DEFAULT_MODEL_FILE: &str = "lama_fp32.onnx";
 
 fn bad(cmd: &str, msg: impl Into<String>) -> EngineError {
     EngineError::BadParams { cmd: cmd.into(), msg: msg.into() }
@@ -237,6 +249,149 @@ fn hex(bytes: &[u8]) -> String {
     })
 }
 
+// ----------------------------------------------------------------------------- progress
+
+/// Live progress of a download, shared between the thread that downloads and the UI that draws it.
+#[derive(Debug, Default)]
+pub struct Progress {
+    done: AtomicU64,
+    total: AtomicU64,
+    cancel: AtomicBool,
+}
+
+impl Progress {
+    pub fn new() -> Self {
+        Self::default()
+    }
+    /// Bytes received so far, across every file of the download.
+    pub fn done(&self) -> u64 {
+        self.done.load(Ordering::Relaxed)
+    }
+    /// Bytes expected in all (0 until the hub has answered).
+    pub fn total(&self) -> u64 {
+        self.total.load(Ordering::Relaxed)
+    }
+    /// Done over total, in 0..=1 (0 while the total is not known).
+    pub fn fraction(&self) -> f32 {
+        let total = self.total();
+        if total == 0 { 0.0 } else { (self.done() as f64 / total as f64).clamp(0.0, 1.0) as f32 }
+    }
+    /// Ask the download to stop. It deletes its partial files and returns `Cancelled`.
+    pub fn cancel(&self) {
+        self.cancel.store(true, Ordering::Relaxed);
+    }
+    pub fn is_cancelled(&self) -> bool {
+        self.cancel.load(Ordering::Relaxed)
+    }
+    fn start(&self, total: u64) {
+        self.done.store(0, Ordering::Relaxed);
+        self.total.store(total, Ordering::Relaxed);
+    }
+    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+    fn add(&self, bytes: u64) {
+        let _ = self.done.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |d| Some(d.saturating_add(bytes)));
+    }
+}
+
+// ----------------------------------------------------------------------------- local models
+
+/// A `.onnx` file in the models folder, whether PhotoCraft downloaded it or the user dropped it in.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct LocalModel {
+    /// Path under the models folder, `/`-separated: the name used to select it.
+    pub name: String,
+    pub bytes: u64,
+    /// True when PhotoCraft downloaded it and checked its SHA-256; false for a file added by hand.
+    pub verified: bool,
+}
+
+/// The name [`DEFAULT_MODEL_FILE`] has once downloaded.
+pub fn default_model_name() -> String {
+    format!("{}/{}", DEFAULT_MODEL_REPO.replace('/', "__"), DEFAULT_MODEL_FILE)
+}
+
+fn collect_onnx(dir: &Path, rel: &str, depth: usize, out: &mut Vec<LocalModel>) {
+    let Ok(entries) = std::fs::read_dir(dir) else { return };
+    for entry in entries.filter_map(|e| e.ok()) {
+        if out.len() >= SCAN_LIMIT {
+            return;
+        }
+        let Some(file_name) = entry.file_name().to_str().map(str::to_string) else { continue };
+        let path = entry.path();
+        let name = if rel.is_empty() { file_name.clone() } else { format!("{rel}/{file_name}") };
+        let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
+        if is_dir {
+            if depth < SCAN_DEPTH {
+                collect_onnx(&path, &name, depth + 1, out);
+            }
+            continue;
+        }
+        if !file_name.to_ascii_lowercase().ends_with(".onnx") {
+            continue;
+        }
+        let Ok(meta) = std::fs::metadata(&path) else { continue };
+        if !meta.is_file() {
+            continue;
+        }
+        out.push(LocalModel { verified: manifest_lists(root_of(&path, &name), &name, meta.len()), name, bytes: meta.len() });
+    }
+}
+
+/// The models folder a file named `name` (relative to it) sits in.
+fn root_of(path: &Path, name: &str) -> PathBuf {
+    let mut root = path.to_path_buf();
+    for _ in name.split('/') {
+        root.pop();
+    }
+    root
+}
+
+/// Whether `name` (relative to `root`) is a file PhotoCraft downloaded: its model folder's manifest
+/// lists it at this size. A file at the top level, or in a folder without a manifest, is not.
+fn manifest_lists(root: PathBuf, name: &str, bytes: u64) -> bool {
+    let Some((top, inside)) = name.split_once('/') else { return false };
+    read_installed(&root.join(top)).is_some_and(|m| m.files.iter().any(|f| f.name == inside && f.bytes == bytes))
+}
+
+/// Every `.onnx` file under `root`, sorted by name.
+pub fn list_local(root: &Path) -> Vec<LocalModel> {
+    let mut out = Vec::new();
+    collect_onnx(root, "", 1, &mut out);
+    out.sort_by(|a, b| a.name.cmp(&b.name));
+    out
+}
+
+/// The model the user picked, if it is still in the folder.
+pub fn selected_model(root: &Path) -> Option<String> {
+    let name = std::fs::read_to_string(root.join(SELECTED)).ok()?.trim().to_string();
+    list_local(root).into_iter().any(|m| m.name == name).then_some(name)
+}
+
+/// Remember `name` as the model to use. It must be a file in the folder.
+pub fn select_model(root: &Path, name: &str) -> Result<()> {
+    safe_relative_path(name)?;
+    if !list_local(root).iter().any(|m| m.name == name) {
+        return Err(EngineError::Other(format!("`{name}` is not in the models folder")));
+    }
+    std::fs::create_dir_all(root).map_err(|e| EngineError::Other(format!("cannot create {}: {e}", root.display())))?;
+    std::fs::write(root.join(SELECTED), name).map_err(|e| EngineError::Other(format!("cannot save the choice: {e}")))
+}
+
+/// The model a fill uses: `requested` if given, else the user's pick, else the first one found.
+pub fn resolve_model(root: &Path, requested: &str) -> Result<LocalModel> {
+    let all = list_local(root);
+    if !requested.is_empty() {
+        return all.into_iter().find(|m| m.name == requested).ok_or_else(|| EngineError::Other(format!("`{requested}` is not in the models folder")));
+    }
+    let picked = selected_model(root);
+    let mut all = all;
+    let index = picked.and_then(|n| all.iter().position(|m| m.name == n)).or(if all.is_empty() { None } else { Some(0) });
+    match index {
+        Some(i) => Ok(all.swap_remove(i)),
+        None => Err(EngineError::Other("no Generative Fill model yet: open the tool's Models… window and download the default one, or put a .onnx file in the models folder".into())),
+    }
+}
+
 // ----------------------------------------------------------------------------- network (native)
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -276,44 +431,86 @@ mod net {
         parse_repo_files(&get_text(&format!("{HUB}/api/models/{repo}?blobs=true"))?)
     }
 
-    /// Streams one file into `<dir>/<name>.part`, hashing as it goes, then renames it into place
-    /// only if the size and SHA-256 match what the hub lists.
-    pub fn fetch_file(repo: &str, file: &ModelFile, dir: &Path) -> Result<()> {
+    /// Downloads `file` from the hub's copy of `repo`. See [`fetch_url`].
+    pub fn fetch_file(repo: &str, file: &ModelFile, dir: &Path, progress: &Progress) -> Result<()> {
+        fetch_url(&format!("{HUB}/{repo}/resolve/main/{}", file.name), file, dir, progress)
+    }
+
+    /// Streams `url` into `<dir>/<name>.part`, hashing as it goes and counting bytes in `progress`,
+    /// then renames it into place only if the size and SHA-256 match what the hub lists. Whatever
+    /// goes wrong (network, cancel, size, checksum) the partial file is deleted.
+    pub fn fetch_url(url: &str, file: &ModelFile, dir: &Path, progress: &Progress) -> Result<()> {
         let rel = safe_relative_path(&file.name)?;
         let dest = dir.join(&rel);
         if let Some(parent) = dest.parent() {
             std::fs::create_dir_all(parent).map_err(|e| EngineError::Other(format!("cannot create {}: {e}", parent.display())))?;
         }
         let part = sibling(&dest, "part");
-        let url = format!("{HUB}/{repo}/resolve/main/{}", file.name);
-        let response = agent().get(&url).call().map_err(|e| EngineError::Other(format!("download of `{}` failed ({e})", file.name)))?;
+        let result = stream(url, file, &part, progress);
+        if result.is_err() {
+            let _ = std::fs::remove_file(&part);
+            return result;
+        }
+        std::fs::rename(&part, &dest).map_err(|e| {
+            let _ = std::fs::remove_file(&part);
+            EngineError::Other(format!("cannot install {}: {e}", dest.display()))
+        })
+    }
+
+    fn stream(url: &str, file: &ModelFile, part: &Path, progress: &Progress) -> Result<()> {
+        if progress.is_cancelled() {
+            return Err(EngineError::Cancelled);
+        }
+        let response = agent().get(url).call().map_err(|e| EngineError::Other(format!("download of `{}` failed ({e})", file.name)))?;
         let mut reader = response.into_reader().take(file.bytes.saturating_add(1));
-        let mut out = std::fs::File::create(&part).map_err(|e| EngineError::Other(format!("cannot write {}: {e}", part.display())))?;
+        let mut out = std::fs::File::create(part).map_err(|e| EngineError::Other(format!("cannot write {}: {e}", part.display())))?;
         let mut hasher = Sha256::new();
         let mut written: u64 = 0;
         let mut buf = vec![0u8; 1 << 16];
         loop {
+            if progress.is_cancelled() {
+                return Err(EngineError::Cancelled);
+            }
             let n = reader.read(&mut buf).map_err(|e| EngineError::Other(format!("download of `{}` was interrupted: {e}", file.name)))?;
             if n == 0 {
                 break;
             }
             written = written.saturating_add(n as u64);
             if written > file.bytes {
-                drop(out);
-                let _ = std::fs::remove_file(&part);
                 return Err(EngineError::Other(format!("`{}` is larger than the hub says; not installed", file.name)));
             }
             let Some(chunk) = buf.get(..n) else { break };
             hasher.update(chunk);
             out.write_all(chunk).map_err(|e| EngineError::Other(format!("cannot write {}: {e}", part.display())))?;
+            progress.add(n as u64);
         }
         out.sync_all().ok();
-        drop(out);
-        if written != file.bytes || hex(&hasher.finalize()) != file.sha256 {
-            let _ = std::fs::remove_file(&part);
+        if written != file.bytes {
+            return Err(EngineError::Other(format!("`{}` ended early ({written} of {} bytes); not installed", file.name, file.bytes)));
+        }
+        if hex(&hasher.finalize()) != file.sha256 {
             return Err(EngineError::Other(format!("`{}` failed its checksum; not installed", file.name)));
         }
-        std::fs::rename(&part, &dest).map_err(|e| EngineError::Other(format!("cannot install {}: {e}", dest.display())))?;
+        Ok(())
+    }
+
+    /// Opens `dir` in the system file manager.
+    pub fn open_folder(dir: &Path) -> Result<()> {
+        let program = if cfg!(target_os = "windows") {
+            "explorer"
+        } else if cfg!(target_os = "macos") {
+            "open"
+        } else {
+            "xdg-open"
+        };
+        let mut child = std::process::Command::new(program)
+            .arg(dir)
+            .spawn()
+            .map_err(|e| EngineError::Other(format!("could not open the folder ({e}); it is at {}", dir.display())))?;
+        // Reap the helper so it does not linger as a zombie.
+        std::thread::spawn(move || {
+            let _ = child.wait();
+        });
         Ok(())
     }
 }
@@ -328,20 +525,32 @@ mod net {
     pub fn repo_files(_: &str) -> Result<Vec<ModelFile>> {
         Err(EngineError::Other(OFFLINE.into()))
     }
-    pub fn fetch_file(_: &str, _: &ModelFile, _: &Path) -> Result<()> {
+    pub fn fetch_file(_: &str, _: &ModelFile, _: &Path, _: &Progress) -> Result<()> {
         Err(EngineError::Other(OFFLINE.into()))
+    }
+    pub fn open_folder(_: &Path) -> Result<()> {
+        Err(EngineError::Other("opening folders is not available in the web build".into()))
     }
 }
 
-/// Downloads and verifies `repo`, replacing any earlier copy only once every file has verified.
-fn download(root: &Path, repo: &str) -> Result<Installed> {
+/// Downloads and verifies `repo` (just `only_file` if given), replacing any earlier copy only once
+/// every file has verified.
+fn download(root: &Path, repo: &str, only_file: Option<&str>, progress: &Progress) -> Result<Installed> {
     let dir = model_dir(root, repo)?;
-    let files = net::repo_files(repo)?;
+    let mut files = net::repo_files(repo)?;
+    if let Some(wanted) = only_file {
+        safe_relative_path(wanted)?;
+        files.retain(|f| f.name == wanted);
+        if files.is_empty() {
+            return Err(EngineError::Other(format!("`{wanted}` is not a model file in {repo}")));
+        }
+    }
+    progress.start(files.iter().map(|f| f.bytes).fold(0u64, u64::saturating_add));
     let staging = sibling(&dir, "partial");
     let _ = std::fs::remove_dir_all(&staging);
     std::fs::create_dir_all(&staging).map_err(|e| EngineError::Other(format!("cannot create {}: {e}", staging.display())))?;
     for f in &files {
-        if let Err(e) = net::fetch_file(repo, f, &staging) {
+        if let Err(e) = net::fetch_file(repo, f, &staging, progress) {
             let _ = std::fs::remove_dir_all(&staging);
             return Err(e);
         }
@@ -365,10 +574,39 @@ pub fn search_hub(query: &str, limit: usize) -> Result<Vec<HubModel>> {
     net::search(query, limit)
 }
 
-/// Downloads and verifies `repo` into the cache. Blocks on the network; call it off the UI thread.
-pub fn download_model(repo: &str) -> Result<Installed> {
+/// Downloads and verifies `repo` (just `file`, if given) into the models folder, reporting bytes in
+/// `progress`. Blocks on the network; call it off the UI thread.
+pub fn download_model(repo: &str, file: Option<&str>, progress: &Progress) -> Result<Installed> {
     let root = models_root()?;
-    download(&root, safe_repo(repo)?)
+    download(&root, safe_repo(repo)?, file, progress)
+}
+
+/// Downloads the one-click default model ([`DEFAULT_MODEL_REPO`]).
+pub fn download_default_model(progress: &Progress) -> Result<Installed> {
+    download_model(DEFAULT_MODEL_REPO, Some(DEFAULT_MODEL_FILE), progress)
+}
+
+/// Every `.onnx` file in the models folder.
+pub fn local_models() -> Result<Vec<LocalModel>> {
+    Ok(list_local(&models_root()?))
+}
+
+/// The user's chosen model, if it is still there.
+pub fn selected_model_name() -> Result<Option<String>> {
+    Ok(selected_model(&models_root()?))
+}
+
+/// Choose the model Generative Fill uses.
+pub fn select_local_model(name: &str) -> Result<()> {
+    select_model(&models_root()?, name)
+}
+
+/// Creates the models folder if needed and opens it in the file manager. Returns its path.
+pub fn open_models_folder() -> Result<PathBuf> {
+    let root = models_root()?;
+    std::fs::create_dir_all(&root).map_err(|e| EngineError::Other(format!("cannot create {}: {e}", root.display())))?;
+    net::open_folder(&root)?;
+    Ok(root)
 }
 
 /// Models installed in the cache, sorted by id.
@@ -415,15 +653,6 @@ fn repo_param(cmd: &str, p: &Value) -> Result<String> {
     safe_repo(repo).map(str::to_string).map_err(|e| bad(cmd, e.to_string()))
 }
 
-/// The model the fill uses: `model` if given (it must be installed), else the first installed one.
-fn pick_model(cmd: &str, root: &Path, requested: &str) -> Result<Installed> {
-    let installed = list_installed(root);
-    if !requested.is_empty() {
-        return installed.into_iter().find(|m| m.repo == requested).ok_or_else(|| bad(cmd, format!("`{requested}` is not installed")));
-    }
-    installed.into_iter().next().ok_or_else(|| EngineError::Other("no Generative Fill model is installed yet: choose one in Generative Fill › Models…".into()))
-}
-
 fn has_selection_on_pixels(s: &Session) -> std::result::Result<(), String> {
     let d = s.active().ok_or("no document open")?;
     if d.doc.selection.is_none() {
@@ -453,7 +682,23 @@ fn run_installed(_: &mut Session, _: &Value) -> Result<Value> {
 
 fn run_download(_: &mut Session, p: &Value) -> Result<Value> {
     let repo = repo_param(DOWNLOAD, p)?;
-    serde_json::to_value(download_model(&repo)?).map_err(|e| EngineError::Other(e.to_string()))
+    let file = text_param(DOWNLOAD, p, "file", 256)?;
+    let file = (!file.trim().is_empty()).then(|| file.trim().to_string());
+    serde_json::to_value(download_model(&repo, file.as_deref(), &Progress::new())?).map_err(|e| EngineError::Other(e.to_string()))
+}
+
+fn run_local(_: &mut Session, _: &Value) -> Result<Value> {
+    let root = models_root()?;
+    Ok(json!({ "root": root.display().to_string(), "selected": selected_model(&root), "default": default_model_name(), "models": list_local(&root) }))
+}
+
+fn run_select(_: &mut Session, p: &Value) -> Result<Value> {
+    let name = text_param(SELECT, p, "model", 300)?;
+    if name.trim().is_empty() {
+        return Err(bad(SELECT, "`model` (a name from ai.generativeFill.localModels) is required"));
+    }
+    select_model(&models_root()?, name.trim())?;
+    Ok(json!({ "selected": name.trim() }))
 }
 
 fn run_remove(_: &mut Session, p: &Value) -> Result<Value> {
@@ -469,11 +714,11 @@ fn run_fill(s: &mut Session, p: &Value) -> Result<Value> {
     let guidance = number_param(FILL, p, "guidance", 1.0, 20.0, 7.5)?;
     let requested = text_param(FILL, p, "model", 200)?;
     has_selection_on_pixels(s).map_err(EngineError::Other)?;
-    let model = pick_model(FILL, &models_root()?, requested.trim())?;
+    let model = resolve_model(&models_root()?, requested.trim())?;
     let _ = (prompt, negative, steps, guidance);
     Err(EngineError::Other(format!(
-        "Generative Fill is not available in this build: `{}` is installed, but the inpainting backend that runs it is not part of PhotoCraft yet",
-        model.repo
+        "Generative Fill cannot paint yet: the model `{}` is ready, but the part of PhotoCraft that runs it is not built. Nothing was changed.",
+        model.name
     )))
 }
 
@@ -491,7 +736,9 @@ pub fn specs() -> Vec<CommandSpec> {
     vec![
         quiet(SEARCH, "Search Models…", r#"{"query":text="inpaint","limit":1..100=20} → {query, models:[{id, downloads, likes, pipeline_tag}]}"#, always, run_search),
         quiet(INSTALLED, "Installed Models", "{} → {root, models:[{repo, files, installed_at}]}", always, run_installed),
-        quiet(DOWNLOAD, "Download Model", r#"{"repo":"owner/name"} → the installed model (every file checksum-verified)"#, always, run_download),
+        quiet(DOWNLOAD, "Download Model", r#"{"repo":"owner/name","file":text} → the installed model (every file checksum-verified; `file` limits it to one weight file)"#, always, run_download),
+        quiet(LOCAL, "Local Models", "{} → {root, selected, default, models:[{name, bytes, verified}]} (every .onnx file in the models folder)", always, run_local),
+        quiet(SELECT, "Choose Model", r#"{"model":text} → {selected} (a name from ai.generativeFill.localModels)"#, always, run_select),
         quiet(REMOVE, "Remove Model", r#"{"repo":"owner/name"} → {repo, removed}"#, always, run_remove),
         CommandSpec {
             id: FILL,
@@ -595,5 +842,140 @@ mod tests {
         assert!(text_param(FILL, &json!({"prompt": "x".repeat(MAX_PROMPT_CHARS + 1)}), "prompt", MAX_PROMPT_CHARS).is_err());
         assert!(repo_param(DOWNLOAD, &json!({})).is_err());
         assert!(repo_param(DOWNLOAD, &json!({"repo": "../../etc"})).is_err());
+    }
+
+    fn temp(tag: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("pc-gf-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).expect("dir");
+        d
+    }
+
+    #[test]
+    fn progress_reports_a_fraction_and_cancel() {
+        let p = Progress::new();
+        assert_eq!(p.fraction(), 0.0);
+        p.start(200);
+        p.add(50);
+        assert!((p.fraction() - 0.25).abs() < 1e-6);
+        assert!(!p.is_cancelled());
+        p.cancel();
+        assert!(p.is_cancelled());
+    }
+
+    #[test]
+    fn local_models_show_hand_added_files_and_mark_downloaded_ones() {
+        let root = temp("local");
+        let dl = root.join("owner__good");
+        std::fs::create_dir_all(dl.join("sub")).expect("dir");
+        std::fs::write(dl.join("m.onnx"), b"abcd").expect("w");
+        let m = Installed {
+            repo: "owner/good".into(),
+            files: vec![ModelFile { name: "m.onnx".into(), bytes: 4, sha256: "0".repeat(64) }],
+            installed_at: 1,
+        };
+        std::fs::write(dl.join(MANIFEST), serde_json::to_string(&m).expect("json")).expect("w");
+        std::fs::write(dl.join("sub").join("deep.onnx"), b"xy").expect("w");
+        std::fs::write(root.join("mine.ONNX"), b"xyz").expect("w");
+        std::fs::write(root.join("notes.txt"), b"x").expect("w");
+        std::fs::write(dl.join("m.onnx.part"), b"x").expect("w");
+        let got: Vec<_> = list_local(&root).into_iter().map(|m| (m.name, m.verified)).collect();
+        assert_eq!(
+            got,
+            [
+                ("mine.ONNX".to_string(), false),
+                ("owner__good/m.onnx".to_string(), true),
+                ("owner__good/sub/deep.onnx".to_string(), false),
+            ]
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn choosing_a_model_is_remembered_and_unknown_names_are_refused() {
+        let root = temp("select");
+        std::fs::write(root.join("a.onnx"), b"1").expect("w");
+        std::fs::write(root.join("b.onnx"), b"2").expect("w");
+        assert_eq!(resolve_model(&root, "").expect("first").name, "a.onnx");
+        select_model(&root, "b.onnx").expect("select");
+        assert_eq!(selected_model(&root).as_deref(), Some("b.onnx"));
+        assert_eq!(resolve_model(&root, "").expect("picked").name, "b.onnx");
+        assert!(select_model(&root, "nope.onnx").is_err());
+        assert!(select_model(&root, "../x.onnx").is_err());
+        assert!(resolve_model(&root, "nope.onnx").is_err());
+        std::fs::remove_file(root.join("b.onnx")).expect("rm");
+        assert_eq!(selected_model(&root), None);
+        assert_eq!(resolve_model(&root, "").expect("falls back").name, "a.onnx");
+        let empty = temp("select-empty");
+        assert!(resolve_model(&empty, "").is_err());
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&empty);
+    }
+
+    /// Serves `body` (declaring `declared` bytes) once on localhost; returns the URL.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn serve(body: Vec<u8>, declared: usize) -> String {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        std::thread::spawn(move || {
+            if let Ok((mut conn, _)) = listener.accept() {
+                let mut req = [0u8; 2048];
+                let _ = conn.read(&mut req);
+                let head = format!("HTTP/1.1 200 OK\r\nContent-Length: {declared}\r\nConnection: close\r\n\r\n");
+                let _ = conn.write_all(head.as_bytes());
+                let _ = conn.write_all(&body);
+            }
+        });
+        format!("http://127.0.0.1:{port}/m.onnx")
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn abc() -> ModelFile {
+        ModelFile { name: "m.onnx".into(), bytes: 3, sha256: "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad".into() }
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn a_good_download_is_installed_and_counted() {
+        let dir = temp("fetch-ok");
+        let p = Progress::new();
+        p.start(3);
+        net::fetch_url(&serve(b"abc".to_vec(), 3), &abc(), &dir, &p).expect("download");
+        assert_eq!(std::fs::read(dir.join("m.onnx")).expect("file"), b"abc");
+        assert_eq!(p.done(), 3);
+        assert!(!dir.join("m.onnx.part").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn bad_downloads_leave_nothing_behind() {
+        let cases: [(&str, Vec<u8>, usize); 3] = [
+            ("wrong bytes", b"xyz".to_vec(), 3),
+            ("too big", b"abcdef".to_vec(), 6),
+            ("cut short", b"ab".to_vec(), 3),
+        ];
+        for (label, body, declared) in cases {
+            let dir = temp("fetch-bad");
+            let p = Progress::new();
+            let r = net::fetch_url(&serve(body, declared), &abc(), &dir, &p);
+            assert!(r.is_err(), "{label} should fail");
+            assert!(!dir.join("m.onnx").exists(), "{label}: model installed");
+            assert!(!dir.join("m.onnx.part").exists(), "{label}: part file left");
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn cancelling_stops_the_download_and_cleans_up() {
+        let dir = temp("fetch-cancel");
+        let p = Progress::new();
+        p.cancel();
+        let r = net::fetch_url(&serve(b"abc".to_vec(), 3), &abc(), &dir, &p);
+        assert!(matches!(r, Err(EngineError::Cancelled)));
+        assert!(!dir.join("m.onnx.part").exists());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

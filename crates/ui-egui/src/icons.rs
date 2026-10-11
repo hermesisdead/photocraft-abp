@@ -123,6 +123,7 @@ pub fn tool_icon(t: Tool) -> &'static str {
         Tool::Remove => "bandage-sparkle",
         Tool::Patch => "lasso-select",
         Tool::ContentAwareMove => "arrow-left-right",
+        Tool::GenerativeFill => "wand-sparkles",
         Tool::RedEye => "eye",
         Tool::CloneStamp => "stamp",
         Tool::PatternStamp => "grid-3x3",

@@ -104,6 +104,9 @@ pub enum Tool {
     Healing,
     Patch,
     ContentAwareMove,
+    /// AI Generative Fill: draw a selection, then fill it from a downloaded inpainting model
+    /// (`generative_fill_ui`, engine `ai.generativeFill`).
+    GenerativeFill,
     RedEye,
     CloneStamp,
     PatternStamp,
@@ -138,7 +141,7 @@ pub enum Tool {
 }
 
 impl Tool {
-    pub const ALL: [Tool; 67] = [
+    pub const ALL: [Tool; 68] = [
         Tool::Move,
         Tool::Artboard,
         Tool::RectMarquee,
@@ -177,6 +180,7 @@ impl Tool {
         Tool::Healing,
         Tool::Patch,
         Tool::ContentAwareMove,
+        Tool::GenerativeFill,
         Tool::RedEye,
         Tool::CloneStamp,
         Tool::PatternStamp,
@@ -251,6 +255,7 @@ impl Tool {
             Tool::Healing => "Healing Brush Tool",
             Tool::Patch => "Patch Tool",
             Tool::ContentAwareMove => "Content-Aware Move Tool",
+            Tool::GenerativeFill => "Generative Fill Tool",
             Tool::RedEye => "Red Eye Tool",
             Tool::CloneStamp => "Clone Stamp Tool",
             Tool::PatternStamp => "Pattern Stamp Tool",
@@ -332,7 +337,7 @@ impl Tool {
             Tool::Hand => 'H',
             Tool::RotateView => 'R',
             Tool::Zoom => 'Z',
-            Tool::Remove | Tool::SpotHealing | Tool::Healing | Tool::Patch | Tool::ContentAwareMove | Tool::RedEye => 'J',
+            Tool::Remove | Tool::SpotHealing | Tool::Healing | Tool::Patch | Tool::ContentAwareMove | Tool::GenerativeFill | Tool::RedEye => 'J',
             Tool::CloneStamp | Tool::PatternStamp => 'S',
             Tool::HistoryBrush => 'Y',
             Tool::Blur | Tool::Sharpen | Tool::Smudge => '\0',
@@ -1309,7 +1314,7 @@ mod tests {
         assert!(!Tool::RedEye.is_brushlike());
         assert_eq!(Tool::from_name("patternStamp"), Some(Tool::PatternStamp));
         assert_eq!(Tool::from_name("Pattern Stamp Tool"), Some(Tool::PatternStamp));
-        assert_eq!(Tool::ALL.len(), 67);
+        assert_eq!(Tool::ALL.len(), 68);
         assert_eq!(Tool::from_name("Vertical Type Mask Tool"), Some(Tool::VerticalTypeMask));
         assert_eq!(Tool::from_name("addAnchorPoint"), Some(Tool::AddAnchorPoint));
         assert_eq!(Tool::from_name("Delete Anchor Point Tool"), Some(Tool::DeleteAnchorPoint));

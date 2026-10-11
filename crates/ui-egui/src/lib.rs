@@ -81,6 +81,7 @@ pub mod flick_pan;
 mod font_preview;
 pub mod frame_tool;
 pub mod gallery_ui;
+pub mod generative_fill_ui;
 pub mod gpu_canvas;
 pub mod gpu_status;
 pub mod gradient_ui;
@@ -448,6 +449,8 @@ pub struct PhotocraftApp {
     /// Canvas caches per (document, display): CPU textures hold monitor values; the GPU
     /// canvas state is shared (`canvas::GPU_OUTPUT`).
     canvases: HashMap<(DocId, u32), canvas::CanvasCache>,
+    /// Generative Fill's model browser and its background searches/downloads.
+    pub(crate) generative_fill: generative_fill_ui::Tasks,
     /// Navigator textures belong to open documents, not the lifetime of the egui context.
     navigator_textures: HashMap<DocId, canvas::NavigatorCache>,
     /// Display profile readings (#569).
@@ -676,6 +679,7 @@ impl PhotocraftApp {
             ui: UiState::default(),
             services,
             canvases: HashMap::new(),
+            generative_fill: Default::default(),
             navigator_textures: HashMap::new(),
             monitors: Default::default(),
             checker: None,
@@ -1620,6 +1624,7 @@ impl eframe::App for PhotocraftApp {
         });
         panels::properties_window(self, &ctx);
         brush_panel::window(self, &ctx);
+        generative_fill_ui::window(self, &ctx);
         preset_panels::windows(self, &ctx);
         gradient_ui::editor_window(self, &ctx);
         type_panels_ui::windows(self, &ctx);

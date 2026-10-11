@@ -723,6 +723,7 @@ pub(crate) fn freehand_tool(tool: Tool) -> bool {
             | Tool::MagneticLasso
             | Tool::Patch
             | Tool::ContentAwareMove
+            | Tool::GenerativeFill
             | Tool::QuickSelection
             | Tool::FreeformPen
     )
@@ -4084,7 +4085,7 @@ fn draw_drag_preview(app: &mut PhotocraftApp, painter: &egui::Painter, xf: &View
             let pts: Vec<Pos2> = d.points.iter().map(|p| xf.to_screen(p[0] as f32, p[1] as f32)).collect();
             painter.add(egui::Shape::line(pts, Stroke::new(1.5, crate::theme::Tokens::get(painter.ctx()).accent)));
         }
-        Tool::Lasso | Tool::Patch | Tool::ContentAwareMove => {
+        Tool::Lasso | Tool::Patch | Tool::ContentAwareMove | Tool::GenerativeFill => {
             let mut pts: Vec<Pos2> = d.points.iter().map(|p| xf.to_screen(p[0] as f32, p[1] as f32)).collect();
             if let Some(lasso) = &d.lasso {
                 pts.push(xf.to_screen(lasso.cursor[0] as f32, lasso.cursor[1] as f32));
@@ -4866,7 +4867,7 @@ pub(crate) fn finish_gesture(app: &mut PhotocraftApp, d: Drag) {
         Tool::ContentAwareMove if crate::retouch_ui::patch_drags_selection(app, d.start, d.modifiers) => {
             crate::retouch_ui::finish_content_aware_move(app, d.start, [end[0], end[1]])
         }
-        Tool::Lasso | Tool::Patch | Tool::ContentAwareMove => {
+        Tool::Lasso | Tool::Patch | Tool::ContentAwareMove | Tool::GenerativeFill => {
             let pts: Vec<[f64; 2]> = d.points.iter().map(|p| [p[0], p[1]]).collect();
             if pts.len() >= 3 {
                 let mode = selection_mode(app, d.modifiers);

@@ -154,6 +154,12 @@ rustup target add wasm32-unknown-unknown
 examples/plugins/invert-rs/build.sh      # cargo build --release --target wasm32-unknown-unknown
 ```
 
+[`examples/plugins/paper-texture-c`](../examples/plugins/paper-texture-c) is a larger example in
+freestanding C (built with `clang --target=wasm32`, no Rust target needed): a seeded paper-texture
+generator with `area: "canvas"` and many parameters. Its README lists the controls. One lesson from
+it: the fuel meter charges for code in a skipped `if` block too, so put each optional effect in its
+own `noinline` function and only call it when enabled.
+
 The script also refreshes `crates/plugins/tests/fixtures/invert.wasm`, the test fixture built from
 that source. Any language that targets core WebAssembly works (C, Zig, AssemblyScript, WAT…), as
 long as the module has no imports: in Rust, that means `no_std` or a `std` build that never touches

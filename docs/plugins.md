@@ -160,6 +160,10 @@ generator with `area: "canvas"` and many parameters. Its README lists the contro
 it: the fuel meter charges for code in a skipped `if` block too, so put each optional effect in its
 own `noinline` function and only call it when enabled.
 
+[`examples/plugins/cassette-tape-c`](../examples/plugins/cassette-tape-c) is another C example: it
+draws a whole object (a compact cassette) from signed-distance shapes, with a live preview through
+the normal filter dialog.
+
 The script also refreshes `crates/plugins/tests/fixtures/invert.wasm`, the test fixture built from
 that source. Any language that targets core WebAssembly works (C, Zig, AssemblyScript, WAT…), as
 long as the module has no imports: in Rust, that means `no_std` or a `std` build that never touches
